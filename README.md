@@ -2,12 +2,12 @@
 Tomiris Chekalin
 Group:IT-2503
 
-## 1. What does the program do?
+# 1. What does the program do?
 The program reads temperature data from readings.txt, checks the data, finds unsafe temperatures and sudden temperature changes, and saves the result to archive.json.
 
 After that, the program reads the JSON archive again and checks that the data was saved correctly.
 
-#2. Input file
+# 2. Input file
 
 The input file is readings.txt.Each line contains:
 <img width="1233" height="350" alt="image" src="https://github.com/user-attachments/assets/202234b3-be75-4639-a601-2d7397914379" />
