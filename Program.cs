@@ -1,4 +1,6 @@
 ﻿using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 public enum StorageClass
 {
@@ -16,6 +18,7 @@ public sealed record ImportError(
     int LineNumber,
     string RawLine,
     string Message);
+
 public sealed record Alert(
     Reading Reading,
     bool OutsideRange,
@@ -25,14 +28,25 @@ public sealed record ImportResult(
     IReadOnlyList<Reading> Readings,
     IReadOnlyList<ImportError> Errors);
 
+public sealed record MonitoringArchive(
+    IReadOnlyList<Reading> Readings,
+    IReadOnlyList<ImportError> Errors,
+    IReadOnlyList<Alert> Alerts,
+    DateTimeOffset CreatedAtUtc);
+
 class Program
 {
+    static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+        Converters = { new JsonStringEnumConverter() }
+    };
+
     static void Main()
     {
-        using FileStream stream = new FileStream(
-            "readings.txt",
-            FileMode.Open,
-            FileAccess.Read);
+        using FileStream stream = new(
+            "readings.txt", FileMode.Open, FileAccess.Read);
 
         ImportResult result = ReadReadings(stream);
 
@@ -41,11 +55,10 @@ class Program
 
         foreach (ImportError error in result.Errors)
         {
-            Console.WriteLine(
-                $"Line {error.LineNumber}: {error.Message}");
+            Console.WriteLine($"Line {error.LineNumber}: {error.Message}");
         }
-        IReadOnlyList<Alert> alerts =
-    AnalyzeReadings(result.Readings);
+
+        IReadOnlyList<Alert> alerts = AnalyzeReadings(result.Readings);
 
         Console.WriteLine($"Alerts: {alerts.Count}");
 
@@ -54,16 +67,12 @@ class Program
             string reasons = "";
 
             if (alert.OutsideRange)
-            {
-                reasons += "Outside range";
-            }
+                reasons = "Outside range";
 
             if (alert.AbruptChange)
             {
                 if (reasons.Length > 0)
-                {
                     reasons += "; ";
-                }
 
                 reasons += "Abrupt change";
             }
@@ -71,200 +80,261 @@ class Program
             Console.WriteLine(
                 $"{alert.Reading.SensorId} " +
                 $"{alert.Reading.Timestamp:HH:mm} " +
-                $"{alert.Reading.Temperature} " +
-                $"-> {reasons}");
+                $"{alert.Reading.Temperature} -> {reasons}");
         }
-    }
 
-    static ImportResult ReadReadings(Stream input)
-    {
-        List<Reading> readings = new();
-        List<ImportError> errors = new();
-        Dictionary<string, StorageClass> sensorClasses =
-            new(StringComparer.OrdinalIgnoreCase);
+        MonitoringArchive archive = new(
+            result.Readings,
+            result.Errors,
+            alerts,
+            DateTimeOffset.UtcNow);
 
-        using StreamReader reader = new(
-            input,
-            leaveOpen: true);
-
-        int lineNumber = 0;
-
-        while (reader.ReadLine() is string line)
+        using (FileStream output = new(
+                   "archive.json", FileMode.Create, FileAccess.Write))
         {
-            lineNumber++;
+            WriteArchive(output, archive);
+        }
 
-            if (string.IsNullOrWhiteSpace(line))
-            {
-                continue;
-            }
+        using (MemoryStream memoryStream = new())
+        {
+            WriteArchive(memoryStream, archive);
+            memoryStream.Position = 0;
 
-            if (!TryParseReading(
-                    line,
-                    out Reading? reading,
-                    out string error))
+            MonitoringArchive restored = ReadArchive(memoryStream);
+
+            Console.WriteLine(
+                $"Restored readings: {restored.Readings.Count}");
+            Console.WriteLine(
+                $"Restored errors: {restored.Errors.Count}");
+            Console.WriteLine(
+                $"Restored alerts: {restored.Alerts.Count}");
+        }
+
+        using FileStream input = new(
+            "archive.json", FileMode.Open, FileAccess.Read);
+
+        MonitoringArchive fileArchive = ReadArchive(input);
+
+        if (archive.Readings.Count != fileArchive.Readings.Count ||
+     archive.Errors.Count != fileArchive.Errors.Count ||
+     archive.Alerts.Count != fileArchive.Alerts.Count)
+        {
+            throw new InvalidDataException(
+                "Archive round-trip verification failed.");
+        }
+
+        Console.WriteLine("Archive verification: OK");
+
+        static ImportResult ReadReadings(Stream input)
+        {
+            List<Reading> readings = new();
+            List<ImportError> errors = new();
+
+            Dictionary<string, StorageClass> sensorClasses =
+                new(StringComparer.OrdinalIgnoreCase);
+
+            using StreamReader reader = new(input, leaveOpen: true);
+
+            int lineNumber = 0;
+
+            while (reader.ReadLine() is string line)
             {
-                errors.Add(
-                    new ImportError(
-                        lineNumber,
+                lineNumber++;
+
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                if (!TryParseReading(
                         line,
-                        error));
+                        out Reading? reading,
+                        out string error))
+                {
+                    errors.Add(new ImportError(lineNumber, line, error));
+                    continue;
+                }
 
-                continue;
-            }
-
-            if (sensorClasses.TryGetValue(
-                    reading.StorageClass == StorageClass.Cold
-                        ? reading.SensorId
-                        : reading.SensorId,
-                    out StorageClass previousClass)
-                && previousClass != reading.StorageClass)
-            {
-                errors.Add(
-                    new ImportError(
+                if (sensorClasses.TryGetValue(
+                        reading.SensorId,
+                        out StorageClass previousClass)
+                    && previousClass != reading.StorageClass)
+                {
+                    errors.Add(new ImportError(
                         lineNumber,
                         line,
                         "Storage class mismatch"));
 
-                continue;
+                    continue;
+                }
+
+                sensorClasses[reading.SensorId] =
+                    reading.StorageClass;
+
+                readings.Add(reading);
             }
 
-            sensorClasses[reading.SensorId] =
-                reading.StorageClass;
-
-            readings.Add(reading);
+            return new ImportResult(
+                Array.AsReadOnly(readings.ToArray()),
+                Array.AsReadOnly(errors.ToArray()));
         }
 
-        return new ImportResult(
-            Array.AsReadOnly(readings.ToArray()),
-            Array.AsReadOnly(errors.ToArray()));
-    }
-
-    static bool TryParseReading(
-        string line,
-        out Reading? reading,
-        out string error)
-    {
-        reading = null;
-        error = "";
-
-        string[] parts = line.Split('|');
-
-        if (parts.Length != 4)
+        static bool TryParseReading(
+            string line,
+            out Reading? reading,
+            out string error)
         {
-            error = "Expected 4 fields";
-            return false;
+            reading = null;
+            error = "";
+
+            string[] parts = line.Split('|');
+
+            if (parts.Length != 4)
+            {
+                error = "Expected 4 fields";
+                return false;
+            }
+
+            string sensorId = parts[0].Trim();
+            string timestampText = parts[1].Trim();
+            string storageText = parts[2].Trim();
+            string temperatureText = parts[3].Trim();
+
+            if (sensorId.Length == 0)
+            {
+                error = "SensorId is empty";
+                return false;
+            }
+
+            if (!DateTimeOffset.TryParseExact(
+                    timestampText,
+                    "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal |
+                    DateTimeStyles.AdjustToUniversal,
+                    out DateTimeOffset timestamp))
+            {
+                error = "Invalid timestamp";
+                return false;
+            }
+
+            if (!Enum.TryParse<StorageClass>(
+                    storageText,
+                    true,
+                    out StorageClass storageClass)
+                || !Enum.IsDefined(storageClass))
+            {
+                error = "Invalid storage class";
+                return false;
+            }
+
+            if (!decimal.TryParse(
+                    temperatureText,
+                    NumberStyles.AllowLeadingSign |
+                    NumberStyles.AllowDecimalPoint,
+                    CultureInfo.InvariantCulture,
+                    out decimal temperature))
+            {
+                error = "Invalid temperature";
+                return false;
+            }
+
+            reading = new Reading(
+                sensorId,
+                timestamp,
+                storageClass,
+                temperature);
+
+            return true;
         }
 
-        string sensorId = parts[0].Trim();
-        string timestampText = parts[1].Trim();
-        string storageText = parts[2].Trim();
-        string temperatureText = parts[3].Trim();
-
-        if (sensorId.Length == 0)
+        static IReadOnlyList<Alert> AnalyzeReadings(
+            IReadOnlyList<Reading> readings)
         {
-            error = "SensorId is empty";
-            return false;
-        }
+            List<Alert> alerts = new();
 
-        if (!DateTimeOffset.TryParseExact(
-                timestampText,
-                "yyyy-MM-dd'T'HH:mm:ss'Z'",
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.AssumeUniversal,
-                out DateTimeOffset timestamp))
-        {
-            error = "Invalid timestamp";
-            return false;
-        }
-
-        if (!Enum.TryParse<StorageClass>(
-                storageText,
-                true,
-                out StorageClass storageClass)
-            || !Enum.IsDefined(storageClass))
-        {
-            error = "Invalid storage class";
-            return false;
-        }
-
-        if (!decimal.TryParse(
-                temperatureText,
-                NumberStyles.AllowLeadingSign |
-                NumberStyles.AllowDecimalPoint,
-                CultureInfo.InvariantCulture,
-                out decimal temperature))
-        {
-            error = "Invalid temperature";
-            return false;
-        }
-
-        reading = new Reading(
-            sensorId,
-            timestamp,
-            storageClass,
-            temperature);
-
-        return true;
-    }
-    static IReadOnlyList<Alert> AnalyzeReadings(
-    IReadOnlyList<Reading> readings)
-    {
-        List<Alert> alerts = new();
-
-        var groups = readings
-            .GroupBy(
+            var groups = readings.GroupBy(
                 r => r.SensorId,
                 StringComparer.OrdinalIgnoreCase);
 
-        foreach (var group in groups)
-        {
-            var ordered = group
-                .OrderBy(r => r.Timestamp)
-                .ToList();
-
-            for (int i = 0; i < ordered.Count; i++)
+            foreach (var group in groups)
             {
-                Reading current = ordered[i];
+                List<Reading> ordered = group
+                    .OrderBy(r => r.Timestamp)
+                    .ToList();
 
-                bool outsideRange = IsOutsideRange(current);
-
-                bool abruptChange = false;
-
-                if (i > 0)
+                for (int i = 0; i < ordered.Count; i++)
                 {
-                    Reading previous = ordered[i - 1];
+                    Reading current = ordered[i];
 
-                    abruptChange =
-                        Math.Abs(current.Temperature - previous.Temperature) > 4.0m;
-                }
+                    bool outsideRange =
+                        IsOutsideRange(current);
 
-                if (outsideRange || abruptChange)
-                {
-                    alerts.Add(
-                        new Alert(
+                    bool abruptChange = false;
+
+                    if (i > 0)
+                    {
+                        Reading previous = ordered[i - 1];
+
+                        abruptChange =
+                            Math.Abs(
+                                current.Temperature -
+                                previous.Temperature) > 4.0m;
+                    }
+
+                    if (outsideRange || abruptChange)
+                    {
+                        alerts.Add(new Alert(
                             current,
                             outsideRange,
                             abruptChange));
+                    }
                 }
             }
+
+            return alerts
+                .OrderBy(
+                    a => a.Reading.SensorId,
+                    StringComparer.OrdinalIgnoreCase)
+                .ThenBy(a => a.Reading.Timestamp)
+                .ToList()
+                .AsReadOnly();
         }
 
-        return alerts
-            .OrderBy(a => a.Reading.SensorId, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(a => a.Reading.Timestamp)
-            .ToList()
-            .AsReadOnly();
-    }
-
-    static bool IsOutsideRange(Reading reading)
-    {
-        if (reading.StorageClass == StorageClass.Cold)
+        static bool IsOutsideRange(Reading reading)
         {
-            return reading.Temperature < 2.0m ||
-                   reading.Temperature > 8.0m;
+            if (reading.StorageClass == StorageClass.Cold)
+            {
+                return reading.Temperature < 2.0m ||
+                       reading.Temperature > 8.0m;
+            }
+
+            return reading.Temperature < -22.0m ||
+                   reading.Temperature > -15.0m;
         }
 
-        return reading.Temperature < -22.0m ||
-               reading.Temperature > -15.0m;
+        static void WriteArchive(
+            Stream output,
+            MonitoringArchive archive)
+        {
+            JsonSerializer.Serialize(
+                output,
+                archive,
+                JsonOptions);
+        }
+
+        static MonitoringArchive ReadArchive(Stream input)
+        {
+            MonitoringArchive? archive =
+                JsonSerializer.Deserialize<MonitoringArchive>(
+                    input,
+                    JsonOptions);
+
+            if (archive is null)
+            {
+                throw new InvalidDataException(
+                    "Archive cannot be null.");
+            }
+
+            return archive;
+        }
     }
 }
