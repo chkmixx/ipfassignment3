@@ -16,6 +16,10 @@ public sealed record ImportError(
     int LineNumber,
     string RawLine,
     string Message);
+public sealed record Alert(
+    Reading Reading,
+    bool OutsideRange,
+    bool AbruptChange);
 
 public sealed record ImportResult(
     IReadOnlyList<Reading> Readings,
@@ -39,6 +43,36 @@ class Program
         {
             Console.WriteLine(
                 $"Line {error.LineNumber}: {error.Message}");
+        }
+        IReadOnlyList<Alert> alerts =
+    AnalyzeReadings(result.Readings);
+
+        Console.WriteLine($"Alerts: {alerts.Count}");
+
+        foreach (Alert alert in alerts)
+        {
+            string reasons = "";
+
+            if (alert.OutsideRange)
+            {
+                reasons += "Outside range";
+            }
+
+            if (alert.AbruptChange)
+            {
+                if (reasons.Length > 0)
+                {
+                    reasons += "; ";
+                }
+
+                reasons += "Abrupt change";
+            }
+
+            Console.WriteLine(
+                $"{alert.Reading.SensorId} " +
+                $"{alert.Reading.Timestamp:HH:mm} " +
+                $"{alert.Reading.Temperature} " +
+                $"-> {reasons}");
         }
     }
 
@@ -171,5 +205,66 @@ class Program
             temperature);
 
         return true;
+    }
+    static IReadOnlyList<Alert> AnalyzeReadings(
+    IReadOnlyList<Reading> readings)
+    {
+        List<Alert> alerts = new();
+
+        var groups = readings
+            .GroupBy(
+                r => r.SensorId,
+                StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in groups)
+        {
+            var ordered = group
+                .OrderBy(r => r.Timestamp)
+                .ToList();
+
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                Reading current = ordered[i];
+
+                bool outsideRange = IsOutsideRange(current);
+
+                bool abruptChange = false;
+
+                if (i > 0)
+                {
+                    Reading previous = ordered[i - 1];
+
+                    abruptChange =
+                        Math.Abs(current.Temperature - previous.Temperature) > 4.0m;
+                }
+
+                if (outsideRange || abruptChange)
+                {
+                    alerts.Add(
+                        new Alert(
+                            current,
+                            outsideRange,
+                            abruptChange));
+                }
+            }
+        }
+
+        return alerts
+            .OrderBy(a => a.Reading.SensorId, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(a => a.Reading.Timestamp)
+            .ToList()
+            .AsReadOnly();
+    }
+
+    static bool IsOutsideRange(Reading reading)
+    {
+        if (reading.StorageClass == StorageClass.Cold)
+        {
+            return reading.Temperature < 2.0m ||
+                   reading.Temperature > 8.0m;
+        }
+
+        return reading.Temperature < -22.0m ||
+               reading.Temperature > -15.0m;
     }
 }
